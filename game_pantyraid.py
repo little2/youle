@@ -39,6 +39,8 @@ router = Router()
 
 games = {}  # 群组游戏实例
 
+# 防止群内重复 restart
+is_restarting = {}
 
 
 NAME_POOL = ["依依", "小姚", "小胖", "小唯", "球球", "小宇", "童童", "俊伟", "小石头", "飞飞"]
@@ -347,21 +349,20 @@ async def handle_reward(callback: CallbackQuery):
         print(f"⚠️ 无法私聊用户 {callback.from_user.id}，用户未启动 bot: {e}")
         
 
-
 @router.callback_query(F.data == "restart_game")
 async def handle_restart_game(callback: CallbackQuery):
-    # 先暂停3秒，避免重复点击
-    # await asyncio.sleep(3)
-
-
     chat_id = callback.message.chat.id
 
-    # # 替换按钮为“已点击”状态，防止重复点
-    # await callback.message.edit_reply_markup(
-    #     reply_markup=InlineKeyboardMarkup(
-    #         inline_keyboard=[[InlineKeyboardButton(text="✅ 已重新开始", callback_data="disabled")]]
-    #     )
-    # )
+    # ✅ 如果当前群正在 restart，直接忽略
+    if is_restarting.get(chat_id, False):
+        print(f"⚠️ 群 {chat_id} 正在 restart 中，忽略重复点击")
+        await safe_callback_answer(callback, "⚠️ 正在开启新一局，请稍候～", True)
+        return
+
+    # ✅ 标记正在 restart
+    is_restarting[chat_id] = True
+
+    # 尝试清除按钮
     if callback.message.reply_markup is not None:
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
@@ -373,10 +374,13 @@ async def handle_restart_game(callback: CallbackQuery):
     else:
         print("⏭️ 当前消息本来就没有 reply_markup，跳过 edit_reply_markup")
 
-  
+    try:
+        await start_new_game(chat_id, callback.message)
+        await safe_callback_answer(callback, "已开启新一局！")
+    finally:
+        # ✅ 无论是否出错，最后要解锁
+        is_restarting[chat_id] = False
 
-    await start_new_game(chat_id, callback.message)
-    await safe_callback_answer(callback, "已开启新一局！")
 
 @router.message(Command("points"))
 async def check_points(message: Message):
