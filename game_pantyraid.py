@@ -41,7 +41,7 @@ games = {}  # 群组游戏实例
 
 # 防止群内重复 restart
 is_restarting = {}
-
+game_message_id = 0  # 全局变量，记录当前游戏消息 ID
 
 NAME_POOL = ["依依", "小姚", "小胖", "小唯", "球球", "小宇", "童童", "俊伟", "小石头", "飞飞"]
 POINT_COST = 50
@@ -107,7 +107,7 @@ class MySQLPointManager:
 
 # ========== 游戏类 ==========
 class PantyRaidGame:
-    def __init__(self, image_file_id):
+    def __init__(self, image_file_id, chat_id: int, message_thread_id: int):
         self.image_file_id = image_file_id
         self.reward_file_id = IMAGE_REWARD_MAP.get(image_file_id)
         self.names = random.sample(NAME_POOL, 4)
@@ -115,6 +115,12 @@ class PantyRaidGame:
         self.claimed = {}
         self.finished = False
         self.lock = asyncio.Lock()
+        self.start_time = time.time()
+        self.message_thread = 0
+        self.chat_id = chat_id
+        self.message_thread_id = message_thread_id
+        
+        asyncio.create_task(self.auto_timeout_checker())
 
     def is_all_claimed(self):
         return len(self.claimed) == 4
@@ -122,7 +128,6 @@ class PantyRaidGame:
     def markup_to_json(self, markup):
       
         return json.dumps(markup.model_dump(), sort_keys=True) if markup else ''
-
 
     def get_game_description(self):
         return (
@@ -141,6 +146,67 @@ class PantyRaidGame:
             inline_keyboard=[[InlineKeyboardButton(text=f"🩲 {name}", callback_data=f"panty_{name}")]
                              for name in self.names]
         )
+
+    async def auto_timeout_checker(self):
+        await asyncio.sleep(30)  # 等待 60 秒
+        async with self.lock:
+            if not self.finished:
+                self.finished = True
+                print("⌛ 游戏超时，自动揭晓结果")
+                try:
+                    # 删除原下注消息（防止点击）
+                    if self.claimed:
+                        # 找一个玩家的 message 去揭晓（偷懒做法）
+                        any_uid = next(iter(self.claimed.values()))['user_id']
+                        any_chat_id = None
+                        for g_chat_id, g in games.items():
+                            if g is self:
+                                any_chat_id = g_chat_id
+                                break
+                        if any_chat_id:
+                            await self.reveal_results_by_chat_id(any_chat_id)
+                except Exception as e:
+                    print(f"⚠️ 自动揭晓失败：{e}")
+
+    async def reveal_results_by_chat_id(self, chat_id: int):
+        try:
+            # ✅ 先移除旧图的按钮（如果还没删）
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=game_message_id,
+                    reply_markup=None
+                )
+            except TelegramBadRequest as e:
+                if "message is not modified" in str(e):
+                    print("⚠️ 按钮已经为空，无需修改")
+                else:
+                    print(f"⚠️ 无法清除旧按钮: {e}")
+          
+
+            # ✅ 删除整条旧游戏消息
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=game_message_id)
+            except TelegramBadRequest as e:
+                print(f"⚠️ 删除旧消息失败: {e}")
+
+            # ✅ 然后发送自动揭晓
+            result_msg = await bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=self.message_thread_id,
+                text=(
+                    f"⏱️ 一分钟过去了，自动揭晓：\n\n"
+                    f"🔔 小基弟弟是：<span class='tg-spoiler'>{self.true_boy}</span>\n\n"
+                    f"本轮无人猜中，欢迎再来一局 🩲"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_restart_keyboard()
+            )
+        except Exception as e:
+            print(f"⚠️ reveal_results_by_chat_id 出错：{e}")
+
+
+
 
     async def handle_panty(self, callback: CallbackQuery, choice: str):
         async with self.lock:
@@ -293,10 +359,15 @@ async def safe_callback_answer(callback: CallbackQuery, text: str, show_alert: b
 @router.message(Command("start_pantyraid"))
 async def start_game(message: Message):
     chat_id = message.chat.id
+    thread_id = getattr(message, 'message_thread_id', None)  # 支援主题串
+
+    # 防止重复开启游戏
     existing_game = games.get(chat_id)
     if existing_game and not existing_game.finished:
         await message.answer("⚠️ 本局游戏尚未结束，请先完成当前游戏再开启新局！")
         return
+
+    # 开启新游戏
     await start_new_game(chat_id, message)
 
 @router.callback_query(F.data.startswith("panty_"))
@@ -430,10 +501,29 @@ async def start_command(message: Message):
 
 # ========== 启动新游戏 ==========
 async def start_new_game(chat_id: int, message: Message):
+    global game_message_id  # ✅ 添加这行
     image_file_id = random.choice(list(IMAGE_REWARD_MAP.keys()))
-    game = PantyRaidGame(image_file_id)
+    # game = PantyRaidGame(image_file_id, chat_id=chat_id, message_thread_id=message.message_thread_id )
+    # games[chat_id] = game
+    # await message.answer_photo(photo=image_file_id, caption=game.get_game_description(), reply_markup=game.get_keyboard())
+   
+
+    game = PantyRaidGame(
+        image_file_id,
+        chat_id=chat_id,
+        message_thread_id=getattr(message, "message_thread_id", None)
+       
+    )
     games[chat_id] = game
-    await message.answer_photo(photo=image_file_id, caption=game.get_game_description(), reply_markup=game.get_keyboard())
+
+    ret = await message.answer_photo(
+        photo=image_file_id,
+        caption=game.get_game_description(),
+        reply_markup=game.get_keyboard()
+    )
+   
+    game_message_id = ret.message_id if ret else 0
+    print(f"✅ {game_message_id}")
 
 # ========== 数据库连接 ==========
 async def init_mysql_pool():
