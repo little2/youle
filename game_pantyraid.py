@@ -44,9 +44,15 @@ is_restarting = {}
 game_message_id = 0  # 全局变量，记录当前游戏消息 ID
 
 NAME_POOL = ["依依", "小姚", "小胖", "小唯", "球球", "小宇", "童童", "俊伟", "小石头", "飞飞"]
-POINT_COST = 50
-POINT_REWARD = 100
+POINT_COST = 15
+POINT_REWARD = 30
 DEFAULT_POINT = 0
+
+# ===== 新增：统一运营时限 =====
+MAX_RUNTIME_SEC = 15 * 60          # 15 分钟
+START_TS = time.time()             # 程序启动时间
+SHUTDOWN_REQUESTED = False         # 标记：是否已到达关机时限
+
 
 
 class ThreadSafeThrottleMiddleware(BaseMiddleware):
@@ -107,6 +113,9 @@ class MySQLPointManager:
 
 # ========== 游戏类 ==========
 class PantyRaidGame:
+
+
+
     def __init__(self, image_file_id, chat_id: int, message_thread_id: int):
         self.image_file_id = image_file_id
         self.reward_file_id = IMAGE_REWARD_MAP.get(image_file_id)
@@ -148,7 +157,7 @@ class PantyRaidGame:
         )
 
     async def auto_timeout_checker(self):
-        await asyncio.sleep(30)  # 等待 60 秒
+        await asyncio.sleep(60)  # 等待 60 秒
         async with self.lock:
             if not self.finished:
                 self.finished = True
@@ -165,7 +174,11 @@ class PantyRaidGame:
                                 break
                         if any_chat_id:
                             await self.reveal_results_by_chat_id(any_chat_id)
+                    else:
+                        # 删除信息 
+                        await self.reveal_results_by_chat_id(self.chat_id)
                 except Exception as e:
+
                     print(f"⚠️ 自动揭晓失败：{e}")
 
     async def reveal_results_by_chat_id(self, chat_id: int):
@@ -195,8 +208,8 @@ class PantyRaidGame:
                 chat_id=chat_id,
                 message_thread_id=self.message_thread_id,
                 text=(
-                    f"⏱️ 一分钟过去了，自动揭晓：\n\n"
-                    f"🔔 小基弟弟是：<span class='tg-spoiler'>{self.true_boy}</span>\n\n"
+                    # f"⏱️ 一分钟过去了，自动揭晓：\n\n"
+                    # f"🔔 小基弟弟是：<span class='tg-spoiler'>{self.true_boy}</span>\n\n"
                     f"本轮无人猜中，欢迎再来一局 🩲"
                 ),
                 parse_mode=ParseMode.HTML,
@@ -355,9 +368,16 @@ async def safe_callback_answer(callback: CallbackQuery, text: str, show_alert: b
     except Exception as e:
         print(f"忽略 query 错误: {e}")
 
+
+def runtime_exceeded() -> bool:
+    return (time.time() - START_TS) >= MAX_RUNTIME_SEC
+
 # ========== 游戏控制 ==========
 @router.message(Command("start_pantyraid"))
 async def start_game(message: Message):
+    if runtime_exceeded():                 # <-- 新增
+        await message.answer("⏰ 中场休息10分钟。")
+        return
     chat_id = message.chat.id
     thread_id = getattr(message, 'message_thread_id', None)  # 支援主题串
 
@@ -369,6 +389,38 @@ async def start_game(message: Message):
 
     # 开启新游戏
     await start_new_game(chat_id, message)
+
+async def shutdown_after_timeout(dispatcher: Dispatcher):
+    global SHUTDOWN_REQUESTED
+    await asyncio.sleep(MAX_RUNTIME_SEC)
+    SHUTDOWN_REQUESTED = True
+    print("⏰ 达到弟弟工时限制，等待当前回合结束…")
+
+    # ✅ 第一阶段：等待所有游戏正常结束
+    while any(not g.finished for g in games.values()):
+        await asyncio.sleep(2)
+
+    print("🧺 全部游戏回合结束，准备广播结束消息")
+
+    # ✅ 第二阶段：通知各群组
+    for chat_id, game in games.items():
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=game.message_thread_id,
+                text="🕓 营业时间结束，弟弟们要回更衣室休息了～\n欢迎稍后再来一局 🩲",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            print(f"⚠️ 无法在群 {chat_id} 发送结束提示：{e}")
+        await asyncio.sleep(1)  # 防止被 Telegram rate limit
+
+    print("🎮 已发送所有结束消息，准备停止 polling")
+    await dispatcher.stop_polling()
+    await bot.session.close()
+    print("✅ 弟弟们已回休息室了")
+
+
 
 @router.callback_query(F.data.startswith("panty_"))
 async def handle_panty(callback: CallbackQuery):
@@ -548,7 +600,18 @@ async def main():
 
     dp.include_router(router)
     
-    await dp.start_polling(bot)
+
+    # ===== 新增：启动关机计时器 =====
+    asyncio.create_task(shutdown_after_timeout(dp))
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # ✅ 确保关闭连接池
+        print("🔌 正在关闭 MySQL 连接池…")
+        pool.close()
+        await pool.wait_closed()
+        print("✅ MySQL 连接池已关闭")
 
     # 遍历IMAGE_REWARD_MAP,并发发送图片
 
