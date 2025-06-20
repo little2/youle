@@ -116,19 +116,17 @@ class PantyRaidGame:
 
 
 
-    def __init__(self, image_file_id, chat_id: int, message_thread_id: int):
-        self.image_file_id = image_file_id
-        self.reward_file_id = IMAGE_REWARD_MAP.get(image_file_id)
-        self.names = random.sample(NAME_POOL, 4)
-        self.true_boy = random.choice(self.names)
-        self.claimed = {}
-        self.finished = False
-        self.lock = asyncio.Lock()
-        self.start_time = time.time()
-        self.message_thread = 0
-        self.chat_id = chat_id
-        self.message_thread_id = message_thread_id
-        
+    def __init__(self, image_file_id, chat_id: int, thread_id: int, message_id: int):
+        self.image_file_id    = image_file_id
+        self.reward_file_id   = IMAGE_REWARD_MAP.get(image_file_id)
+        self.chat_id          = chat_id
+        self.thread_id        = thread_id
+        self.message_id       = message_id    # ← 保存这局的消息 ID
+        self.names            = random.sample(NAME_POOL, 4)
+        self.true_boy         = random.choice(self.names)
+        self.claimed          = {}
+        self.finished         = False
+        self.lock             = asyncio.Lock()
         asyncio.create_task(self.auto_timeout_checker())
 
     def is_all_claimed(self):
@@ -156,31 +154,86 @@ class PantyRaidGame:
                              for name in self.names]
         )
 
+    # async def auto_timeout_checker(self):
+    #     await asyncio.sleep(60)  # 等待 60 秒
+    #     async with self.lock:
+    #         if not self.finished:
+    #             self.finished = True
+    #             print("⌛ 游戏超时，自动揭晓结果")
+    #             try:
+    #                 # 删除原下注消息（防止点击）
+    #                 if self.claimed:
+    #                     # 找一个玩家的 message 去揭晓（偷懒做法）
+    #                     any_uid = next(iter(self.claimed.values()))['user_id']
+    #                     any_chat_id = None
+    #                     for g_chat_id, g in games.items():
+    #                         if g is self:
+    #                             any_chat_id = g_chat_id
+    #                             break
+    #                     if any_chat_id:
+    #                         await self.reveal_results_by_chat_id(any_chat_id)
+    #                 else:
+    #                     # 删除信息 
+    #                     await self.reveal_results_by_chat_id(self.chat_id)
+    #             except Exception as e:
+
+    #                 print(f"⚠️ 自动揭晓失败：{e}")
+
     async def auto_timeout_checker(self):
-        await asyncio.sleep(60)  # 等待 60 秒
+        await asyncio.sleep(60)
         async with self.lock:
-            if not self.finished:
-                self.finished = True
-                print("⌛ 游戏超时，自动揭晓结果")
-                try:
-                    # 删除原下注消息（防止点击）
-                    if self.claimed:
-                        # 找一个玩家的 message 去揭晓（偷懒做法）
-                        any_uid = next(iter(self.claimed.values()))['user_id']
-                        any_chat_id = None
-                        for g_chat_id, g in games.items():
-                            if g is self:
-                                any_chat_id = g_chat_id
-                                break
-                        if any_chat_id:
-                            await self.reveal_results_by_chat_id(any_chat_id)
-                    else:
-                        # 删除信息 
-                        await self.reveal_results_by_chat_id(self.chat_id)
-                except Exception as e:
+            if self.finished:
+                return
+            self.finished = True
+        # 删除原游戏消息，防止再点击
+        try:
+            await bot.delete_message(chat_id=self.chat_id, message_id=self.message_id)
+        except TelegramBadRequest:
+            pass
+        await self.reveal_timeout()
 
-                    print(f"⚠️ 自动揭晓失败：{e}")
+    async def reveal_timeout(self):
+        # 统一揭晓流程
+        lines = [f"⌛ 超时自动揭晓！真·小基弟弟是：<span class='tg-spoiler'>{self.true_boy}</span>\n"]
+        winner = None
 
+        # 先看谁猜中了
+        for name, who in self.claimed.items():
+            if name == self.true_boy:
+                winner = who
+                lines.append(f"🎉 恭喜 <u>{who['user_name']}</u> 猜对了，获得 {POINT_REWARD} 积分！")
+                await point_manager.update_user_point(who['user_id'], POINT_REWARD)
+
+        # 如果没人猜中，但有人参与，则随机挑一位发安慰奖
+        if not winner and self.claimed:
+            losers = list(self.claimed.values())
+            who = random.choice(losers)
+            winner = who
+            half = POINT_REWARD // 2
+            lines.append(f"🔔 没有人猜中，随机安慰奖励给 <u>{who['user_name']}</u>，获得 {half} 积分！")
+            await point_manager.update_user_point(who['user_id'], half)
+
+        # 如果根本没人参与
+        if not self.claimed:
+            await bot.send_message(
+                chat_id=self.chat_id,
+                message_thread_id=self.thread_id,
+                text="⌛️ 本轮无人下注，欢迎再来一局 🩲",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_restart_keyboard()    # ← 加上再来一局按钮
+            )
+            return
+
+        # 发送揭晓，并附上「再来一局」或「领奖」按钮
+        markup = get_winner_keyboard(winner['user_id']) if winner and winner['user_id'] in {c['user_id'] for c in self.claimed.values()} else get_restart_keyboard()
+        await bot.send_message(
+            chat_id=self.chat_id,
+            message_thread_id=self.thread_id,
+            text="\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup
+        )
+        
     async def reveal_results_by_chat_id(self, chat_id: int):
         try:
             # ✅ 先移除旧图的按钮（如果还没删）
@@ -552,30 +605,50 @@ async def start_command(message: Message):
 
 
 # ========== 启动新游戏 ==========
-async def start_new_game(chat_id: int, message: Message):
-    global game_message_id  # ✅ 添加这行
-    image_file_id = random.choice(list(IMAGE_REWARD_MAP.keys()))
-    # game = PantyRaidGame(image_file_id, chat_id=chat_id, message_thread_id=message.message_thread_id )
-    # games[chat_id] = game
-    # await message.answer_photo(photo=image_file_id, caption=game.get_game_description(), reply_markup=game.get_keyboard())
+# async def start_new_game(chat_id: int, message: Message):
+#     global game_message_id  # ✅ 添加这行
+#     image_file_id = random.choice(list(IMAGE_REWARD_MAP.keys()))
+#     # game = PantyRaidGame(image_file_id, chat_id=chat_id, message_thread_id=message.message_thread_id )
+#     # games[chat_id] = game
+#     # await message.answer_photo(photo=image_file_id, caption=game.get_game_description(), reply_markup=game.get_keyboard())
    
 
-    game = PantyRaidGame(
-        image_file_id,
-        chat_id=chat_id,
-        message_thread_id=getattr(message, "message_thread_id", None)
-       
-    )
+#     game = PantyRaidGame(
+#         image_file_id,
+#         chat_id=chat_id,
+#         message_thread_id=getattr(message, "message_thread_id", None)
+#         ret.message_id
+#     )
+#     games[chat_id] = game
+
+#     ret = await message.answer_photo(
+#         photo=image_file_id,
+#         caption=game.get_game_description(),
+#         reply_markup=game.get_keyboard()
+#     )
+   
+#     game_message_id = ret.message_id if ret else 0
+#     print(f"✅ {game_message_id}")
+
+# ========== 启动新游戏 ==========
+async def start_new_game(chat_id: int, message: Message):
+    # 1. 随机选一张图
+    image_file_id = random.choice(list(IMAGE_REWARD_MAP.keys()))
+    # 2. 暂时把 message_id 设成 None，先创建实例
+    thread_id = getattr(message, "message_thread_id", None)
+    game = PantyRaidGame(image_file_id, chat_id, thread_id, message_id=None)
     games[chat_id] = game
 
+    # 3. 发消息，用 game 的描述和键盘
     ret = await message.answer_photo(
         photo=image_file_id,
         caption=game.get_game_description(),
         reply_markup=game.get_keyboard()
     )
-   
-    game_message_id = ret.message_id if ret else 0
-    print(f"✅ {game_message_id}")
+
+    # 4. 收到 message_id 后再回写到实例里
+    game.message_id = ret.message_id
+
 
 # ========== 数据库连接 ==========
 async def init_mysql_pool():
@@ -595,8 +668,8 @@ async def main():
     point_manager = MySQLPointManager(pool)
 
     # 添加限速中间件（2秒限制一次）
-    dp.message.middleware(ThreadSafeThrottleMiddleware(rate_limit=2.0))
-    dp.callback_query.middleware(ThreadSafeThrottleMiddleware(rate_limit=2.0))
+    dp.message.middleware(ThreadSafeThrottleMiddleware(rate_limit=1.0))
+    dp.callback_query.middleware(ThreadSafeThrottleMiddleware(rate_limit=1.0))
 
     dp.include_router(router)
     
